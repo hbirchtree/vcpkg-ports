@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from json import dumps, loads
-from os import chdir
+from os import chdir, makedirs
 from os.path import dirname, exists
 from subprocess import run, PIPE
 from sys import argv
@@ -42,6 +42,8 @@ print(f':: Updating port {port_name}/{version}/{sem_version}#{port_version}')
 git_tree = git_tree_sha(port_name)
 
 version_file = f'versions/{port_prefix}/{port_name}.json'
+
+makedirs(dirname(version_file), exist_ok=True)
 
 version_object = {
     'port-version': port_version,
