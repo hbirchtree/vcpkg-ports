@@ -3,6 +3,10 @@
     "gamenetworkingsockets": {
       "baseline": "1.6.0",
       "port-version": 0
+    },
+    "datachannel-wasm": {
+      "baseline": "0.4.0",
+      "port-version": 3
     }
   }
 }
