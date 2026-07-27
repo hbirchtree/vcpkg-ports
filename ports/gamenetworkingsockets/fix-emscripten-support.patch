@@ -1,0 +1,293 @@
+Same pattern as fix-android-support.patch's CMAKE_SYSTEM_NAME gates, extended
+for Emscripten -- but NOT aliased to LINUX (see below for why that was
+tried first and reverted). GNS's own platform detection has a hard
+message(FATAL_ERROR "Could not identify your target operating system")
+fallthrough in both CMakeLists.txt and src/CMakeLists.txt whenever
+CMAKE_SYSTEM_NAME isn't one of Linux/Android/Darwin/FreeBSD/Windows --
+Emscripten sets CMAKE_SYSTEM_NAME to "Emscripten", matching none of them,
+so configure failed before a single line of C++ was even compiled
+(confirmed via an isolated wasm32 build spike -- see
+examples/blam/cblam-testing/WEBRTC_TRANSPORT.md). Gets its own empty
+elseif branch in both files, just to avoid the fallthrough.
+
+Also patched here: TARGET_ARCH_FLAGS unconditionally adds -msse2 whenever
+CMAKE_SYSTEM_PROCESSOR matches an x86 pattern -- under the wasm32-emscripten
+triplet, CMAKE_SYSTEM_PROCESSOR still reports the host arch (x86_64), not a
+wasm-specific value (a cross-compile toolchain-detection quirk, not GNS's
+doing), so GNS believed it should target native x86 SSE2 and passed -msse2
+to em++, which errors unless paired with -msimd128/-mrelaxed-simd. Excluded
+via CMAKE_SYSTEM_NAME MATCHES Emscripten -- wasm32 has no native SSE2 to
+target in the first place, so the flag should never apply here regardless.
+
+First attempt at the CMAKE_SYSTEM_NAME gates aliased Emscripten to LINUX
+(same macro Android gets), since GNS's own platform macros
+(src/public/minbase/minbase_identify.h) don't have a general "unsupported
+but keep going" fallback either. That broke worse than it fixed:
+IsLinux()-gated code assumes real kernel facilities Emscripten's libc
+doesn't have -- sys/ptrace.h (src/tier0/dbg.cpp, debugger-session
+detection) and epoll (src/public/tier0/platform_sockets.h, the socket
+polling backend) both don't exist under Emscripten, and both are gated on
+IsLinux(), not on anything more specific. Given Emscripten's own identity
+doesn't need to reuse Linux's for correctness -- IsPosix() alone is enough
+for GNS's socket/threading code -- minbase_identify.h gets a real
+IsEmscripten() of its own instead:
+  - dbg.cpp: same false-return stub Android already has for
+    Plat_IsInDebugSession(), since Emscripten has no debugger-session
+    concept either. The ptrace.h #include itself is already gated on
+    IsLinux(), so once Emscripten stops claiming that, it's skipped for
+    free.
+  - platform_sockets.h: routed to the same USE_POLL fallback __APPLE__
+    already uses instead of USE_EPOLL -- confirmed USE_POLL has a full
+    alternate implementation throughout steamnetworkingsockets_lowlevel.cpp
+    before relying on it, not just a stub.
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt	2026-07-20 11:23:05.773405364 +0000
++++ b/CMakeLists.txt	2026-07-20 11:23:22.550817996 +0000
+@@ -134,7 +134,7 @@
+ endif()
+ 
+ # We always need at least sse2 on x86
+-if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64.*|x86_64.*|AMD64.*|i686.*|i386.*|x86.*")
++if(CMAKE_SYSTEM_PROCESSOR MATCHES "amd64.*|x86_64.*|AMD64.*|i686.*|i386.*|x86.*" AND NOT CMAKE_SYSTEM_NAME MATCHES Emscripten)
+        set(TARGET_ARCH_FLAGS "-msse2")
+ endif()
+ 
+@@ -148,6 +148,12 @@
+ 
+     if(CMAKE_SYSTEM_NAME MATCHES Linux OR CMAKE_SYSTEM_NAME MATCHES Android)
+ 		target_compile_definitions(${TGT} PUBLIC LINUX)
++	elseif(CMAKE_SYSTEM_NAME MATCHES Emscripten)
++		# Deliberately NOT aliased to LINUX: minbase_identify.h gives
++		# Emscripten its own IsEmscripten()/IsPosix() identity instead,
++		# since IsLinux()-gated code (epoll, /proc/self/status ptrace
++		# detection) assumes real kernel facilities Emscripten's libc
++		# doesn't provide.
+ 	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
+ 		target_compile_definitions(${TGT} PUBLIC OSX)
+ 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+--- a/src/CMakeLists.txt	2026-07-20 11:23:05.781427888 +0000
++++ b/src/CMakeLists.txt	2026-07-20 11:23:32.286323119 +0000
+@@ -294,6 +294,8 @@
+ 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
+ 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
+ 		#endif()
++	elseif(CMAKE_SYSTEM_NAME MATCHES Emscripten)
++		# No dl linking needed or available.
+ 	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
+ 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
+ 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
+diff --git a/src/public/minbase/minbase_identify.h b/src/public/minbase/minbase_identify.h
+--- a/src/public/minbase/minbase_identify.h	2026-07-20 11:23:05.787960415 +0000
++++ b/src/public/minbase/minbase_identify.h	2026-07-20 11:23:46.237046645 +0000
+@@ -144,6 +144,13 @@
+ #elif defined( __ANDROID__ ) || defined( ANDROID )
+ 	#define IsAndroid() true
+ 	#define IsPosix() true
++#elif defined( __EMSCRIPTEN__ )
++	// Deliberately its own identity, not aliased to IsLinux(): Emscripten's
++	// libc emulates enough POSIX for GNS's socket/threading code, but has
++	// no epoll, no /proc, no ptrace -- code gated on IsLinux() assumes
++	// real kernel facilities that don't exist here.
++	#define IsEmscripten() true
++	#define IsPosix() true
+ #elif defined(__APPLE__)
+ 	#include <TargetConditionals.h>
+ 	#if defined( TARGET_OS_MAC )
+@@ -178,6 +185,9 @@
+ #ifndef IsAndroid
+ 	#define IsAndroid() false
+ #endif
++#ifndef IsEmscripten
++	#define IsEmscripten() false
++#endif
+ #ifndef IsConsole
+ 	#define IsConsole() false
+ #endif
+diff --git a/src/tier0/dbg.cpp b/src/tier0/dbg.cpp
+--- a/src/tier0/dbg.cpp	2026-07-20 11:23:05.793908488 +0000
++++ b/src/tier0/dbg.cpp	2026-07-20 11:23:53.114403197 +0000
+@@ -90,6 +90,8 @@
+ 	return false;
+ #elif IsAndroid()
+     return false;
++#elif IsEmscripten()
++	return false;
+ #else
+ 	#error "HALP"
+ #endif
+diff --git a/src/public/tier0/platform_sockets.h b/src/public/tier0/platform_sockets.h
+--- a/src/public/tier0/platform_sockets.h	2026-07-20 11:23:05.800741748 +0000
++++ b/src/public/tier0/platform_sockets.h	2026-07-20 11:24:00.706796723 +0000
+@@ -104,7 +104,7 @@
+ 		return errno;
+ 	}
+ 
+-	#ifdef __APPLE__
++	#if defined(__APPLE__) || defined(__EMSCRIPTEN__)
+ 		#define USE_POLL
+ 	#else
+ 		#define USE_EPOLL
+
+Additionally: csteamnetworkingsockets.cpp's platform-name string
+function has the same IsXxx() #elif chain shape with the same
+#error "Unknown platform" fallthrough -- same fix, give Emscripten
+its own branch rather than erroring.
+
+diff --git a/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp b/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
+--- a/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp	2026-07-20 11:26:12.117970231 +0000
++++ b/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp	2026-07-20 11:26:19.537976377 +0000
+@@ -2409,6 +2409,8 @@
+ 		return "windows";
+ 	#elif IsLinux()
+ 		return "linux";
++	#elif IsEmscripten()
++		return "emscripten";
+ 	#elif defined( FREEBSD ) || defined( __FreeBSD__ )
+ 		return "freebsd";
+ 	#else
+
+Same "assumes real POSIX kernel facilities" issue as the socket-polling
+backend above, but discovered at runtime rather than compile time (see
+examples/blam/cblam-testing/WEBRTC_TRANSPORT.md's Phase 3 "first real
+browser run" section): BSteamNetworkingSocketsLowLevelAddRef()
+unconditionally opens a socketpair() as a self-pipe to wake the
+background service thread. Emscripten's libc has no socketpair()
+implementation at all -- confirmed at runtime ("warning: unsupported
+syscall: __syscall_socketpair"), not just missing a header -- so
+GameNetworkingSockets_Init() itself failed outright on every wasm run,
+before a single connection was ever attempted. Fixed with a new
+IsEmscripten() branch alongside the existing Playstation one ("no
+additional setup needed here"): no wake-thread socket is needed at all,
+since this project always calls
+SteamNetworkingSockets_SetManualPollMode(true) immediately after Init()
+on Emscripten (Networking::Networking(), networking.cpp) specifically so
+the background service thread never runs there.
+
+That still leaves a narrow window: AddRef() unconditionally tries to
+start the service thread *before* the caller's SetManualPollMode(true)
+call gets a chance to run (they're two separate statements). Emscripten
+pthreads are real Web Workers -- creating one is asynchronous, and
+tearing it back down (StopServiceThread()'s join()) blocks the calling
+thread until the worker actually starts and exits, which is fatal when
+the caller is the browser's real main thread (this project never uses
+-sPROXY_TO_PTHREAD, see src/peripheral/platform/CMakeLists.txt). Guarded
+both places a service thread can be spun up (AddRef's initial start, and
+SetManualPollMode's restart-on-toggle-off branch) with !IsEmscripten()
+so it can never happen at all, rather than relying on the two statements
+always running back-to-back with no yield point in between.
+
+diff --git a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp
+--- a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp
++++ b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_lowlevel.cpp
+@@ -2041,7 +2041,21 @@
+ 			#if defined( WAKE_THREAD_USING_EVENT )
+ 				ADD_POLL_FD( s_hEventWakeThread );
+ 			#elif defined( WAKE_THREAD_USING_SOCKET_PAIR )
+-				ADD_POLL_FD( s_hSockWakeThreadRead );
++				// Emscripten leaves this INVALID_SOCKET (see IsEmscripten()
++				// below -- no socketpair() there), so ADD_POLL_FD's assert
++				// would fire every call. poll() ignores negative fds, so
++				// reserve the slot with one instead of asserting.
++				if ( s_hSockWakeThreadRead != INVALID_SOCKET )
++				{
++					ADD_POLL_FD( s_hSockWakeThreadRead );
++				}
++				else
++				{
++					pollfd &p = *s_vecPollFDs.AddToTailGetPtr();
++					p.fd = -1;
++					p.events = 0;
++					p.revents = POLLEVENT_INVALID;
++				}
+ 			#else
+ 				#error "How will we cancel this poll?"
+ 			#endif
+@@ -3287,6 +3301,15 @@
+ 			}
+ 		#elif IsPlaystation()
+ 			// No additional setup needed here
++		#elif IsEmscripten()
++			// No additional setup needed here either: Emscripten's libc has
++			// no socketpair() (confirmed at runtime -- "unsupported syscall:
++			// __syscall_socketpair", not just a compile-time gap), and this
++			// project never lets the background service thread run on
++			// Emscripten in the first place (see the IsEmscripten() guard
++			// on thread creation below), so nothing ever needs a wake-thread
++			// signal here. WakeServiceThread()/WakeSteamDatagramThread()
++			// already no-op when s_hSockWakeThreadWrite is INVALID_SOCKET.
+ 		#else
+ 		{
+ 			Assert( s_hSockWakeThreadRead == INVALID_SOCKET );
+@@ -3348,8 +3371,18 @@
+ 
+ 	s_nLowLevelSupportRefCount.fetch_add(1, std::memory_order_acq_rel);
+ 
+-	// Make sure the thread is running, if it should be
+-	if ( !s_bManualPollMode && !s_pServiceThread )
++	// Make sure the thread is running, if it should be. Never on Emscripten:
++	// creating a pthread there spins up a real Web Worker asynchronously,
++	// and stopping it again (StopServiceThread()'s join()) blocks the
++	// calling thread until that worker starts up and exits -- fatal if the
++	// caller is the browser's real main thread, which for this project it
++	// always is (see src/peripheral/platform/CMakeLists.txt's
++	// PROXY_TO_PTHREAD lockout note). This project always drives GNS via
++	// SetManualPollMode(true) on Emscripten (see Networking::Networking(),
++	// examples/blam/cblam-testing/networking.cpp) immediately after this
++	// call returns, but that's a separate, later statement -- without this
++	// guard the thread would still be momentarily created here first.
++	if ( !s_bManualPollMode && !s_pServiceThread && !IsEmscripten() )
+ 		s_pServiceThread = new std::thread( SteamNetworkingThreadProc );
+ 
+ 	// Install an axexit handler, so that if static destruction is triggered without
+@@ -3725,7 +3758,7 @@
+ 	}
+ 	else
+ 	{
+-		if ( s_nLowLevelSupportRefCount.load(std::memory_order_acquire) > 0 && !s_bManualPollMode )
++		if ( s_nLowLevelSupportRefCount.load(std::memory_order_acquire) > 0 && !s_bManualPollMode && !IsEmscripten() )
+ 		{
+ 			// Start up the thread
+ 			SpewMsg( "Service thread is not running, and manual poll mode was turned off, starting service thread.\n" );
+
+PollRawUDPSockets (steamnetworkingsockets_lowlevel.cpp) asserts
+s_hSockWakeThreadRead != INVALID_SOCKET when building its poll list --
+fires every call on Emscripten, since the Init-time IsEmscripten()
+branch above intentionally leaves it invalid. poll() ignores negative
+fds, so the fix just reserves the slot with one instead of asserting.
+
+wasm64 (Emscripten's MEMORY64 target) specifically, found via an actual
+wasm64-emscripten CI build (native wasm32 already worked -- this is
+wasm64-only): "typedef redefinition with different types ('long' vs
+'long long')" in minbase_types.h, plus knock-on "constructor cannot be
+redeclared" errors in steamclientpublic.h wherever it overloads on
+int64/int64_t as distinct types.
+
+Root cause: minbase_types.h's own int64_t typedef branches on
+`COMPILER_GCC && PLATFORM_64BITS && ...`, assuming traditional Linux
+LP64 semantics (`long` is 64-bit and IS the system's int64_t) --
+correct for real GCC/Linux, wrong for Emscripten. Two things conspire:
+Emscripten's clang defines __GNUC__ (for GCC-macro compatibility), so
+minbase_identify.h's own COMPILER_GCC detection (`defined(__GCC__) ||
+defined(__GNUC__)`) already treats it as COMPILER_GCC; and wasm64
+genuinely sets PLATFORM_64BITS (real 64-bit pointers under MEMORY64).
+So this branch fires for wasm64, defining int64_t as `long int` --- but
+Emscripten's own <stdint.h> uses `long long` for int64_t regardless of
+pointer width, causing a direct typedef conflict the instant anything
+includes both. Excluded the same way the rest of this patch treats
+Emscripten as its own platform identity rather than piggybacking on
+Linux/GCC assumptions it doesn't actually share.
+
+diff --git a/src/public/minbase/minbase_types.h b/src/public/minbase/minbase_types.h
+--- a/src/public/minbase/minbase_types.h
++++ b/src/public/minbase/minbase_types.h
+@@ -75,7 +75,7 @@
+ // NOTE: int64_t must match the compiler stdint.h definition
+ // and so may not match the Steam int64.  Mixing the two is
+ // error-prone so always use the Steam non-_t types in Steam code.
+-#if defined(COMPILER_GCC) && defined(PLATFORM_64BITS) && !defined(__MINGW32__) && !IsOSX() && !(defined(IOS) || defined(TVOS))
++#if defined(COMPILER_GCC) && defined(PLATFORM_64BITS) && !defined(__MINGW32__) && !IsOSX() && !(defined(IOS) || defined(TVOS)) && !IsEmscripten()
+ #define INT64_DIFFERENT_FROM_INT64_T 1
+ typedef long int int64_t;
+ typedef unsigned long int uint64_t;
