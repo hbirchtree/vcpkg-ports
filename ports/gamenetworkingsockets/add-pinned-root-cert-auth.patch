@@ -60,15 +60,21 @@
  	/// the same value, to manually configure a specific send rate.  The default
 --- a/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
 +++ b/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
-@@ -122,6 +122,7 @@
+@@ -121,6 +121,13 @@
+ DEFINE_CONNECTON_DEFAULT_CONFIGVAL( int32, EnableDiagnosticsUI, 1, 0, 1 );
  #endif
  
- #ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
++// Authenticating a peer has nothing to do with ICE, and the struct member is
++// declared unconditionally: registering it inside the ICE block would leave
++// builds without ICE (Emscripten, per this port) holding a config value that
++// was never linked to a default, so every Get() walks off the end of the
++// inherit chain.
 +DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, PinnedRootCertPublicKey, "" );
++
+ #ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
  DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_STUN_ServerList, "" );
  DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_TURN_ServerList, "" );
- DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_TURN_UserList, "" );
-@@ -733,6 +734,17 @@
+@@ -733,6 +740,17 @@
  	if ( !pAuthScope )
  	{
  		SpewWarning( "SetCertificate: We are not currently able to verify our own cert!  %s.  Continuing anyway!", errMsg );
@@ -86,7 +92,7 @@
  	}
  
  	// Extract the identity from the cert
-@@ -2584,6 +2596,116 @@
+@@ -2584,6 +2602,116 @@
  
  /////////////////////////////////////////////////////////////////////////////
  //
