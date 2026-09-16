@@ -14,6 +14,7 @@ vcpkg_from_github(
         add-webrtc-datachannel-transport.patch
         add-listen-socket-raw-send.patch
         add-udp-datachannel-connect.patch
+        add-pinned-root-cert-auth.patch
 )
 
 set(CRYPTO_BACKEND OpenSSL)

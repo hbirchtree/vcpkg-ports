@@ -1,0 +1,407 @@
+--- a/include/steam/steamnetworkingsockets.h
++++ b/include/steam/steamnetworkingsockets.h
+@@ -23,6 +23,30 @@
+ // Close all connections and listen sockets and free all resources
+ STEAMNETWORKINGSOCKETS_INTERFACE void GameNetworkingSockets_Kill();
+ 
++/// Issue this interface a certificate for its own connection key, signed by a key
++/// the application owns, so that peers holding the matching public key can
++/// authenticate the session (see k_ESteamNetworkingConfig_PinnedRootCertPublicKey).
++///
++/// Two calls, because the private key stays on the application's side of the
++/// boundary: the first hands you the exact bytes to sign, the second takes your
++/// detached Ed25519 signature over those bytes and installs the result.  Call the
++/// first with pBlob=NULL to size the buffer, as with GetCertificateRequest.
++///
++/// nSecondsValid sets the cert's expiry; peers reject expired certs.
++STEAMNETWORKINGSOCKETS_INTERFACE bool SteamNetworkingSockets_GetSelfSignedCertBlobToSign(
++	ISteamNetworkingSockets *pInterface, int nSecondsValid,
++	int *pcbBlob, void *pBlob, SteamNetworkingErrMsg &errMsg );
++
++/// Second half of the above.  pSignature is the detached Ed25519 signature over the
++/// blob exactly as returned, and pRootPublicKey the raw public key it verifies
++/// against, used to stamp the cert with the issuing key's ID.
++STEAMNETWORKINGSOCKETS_INTERFACE bool SteamNetworkingSockets_InstallSelfSignedCert(
++	ISteamNetworkingSockets *pInterface,
++	const void *pCertBlob, int cbCertBlob,
++	const void *pSignature, int cbSignature,
++	const void *pRootPublicKey, int cbRootPublicKey,
++	SteamNetworkingErrMsg &errMsg );
++
+ /// Custom memory allocation methods.  If you call this, you MUST call it exactly once,
+ /// before calling any other API function.  *Most* allocations will pass through these,
+ /// especially all allocations that are per-connection.  A few allocations
+--- a/include/steam/steamnetworkingtypes.h
++++ b/include/steam/steamnetworkingtypes.h
+@@ -1229,6 +1229,24 @@
+ 	//    ensure you have the current value.
+ 	k_ESteamNetworkingConfig_ConnectionUserData = 40,
+ 
++	/// [connection string] Base64 of a raw 32-byte Ed25519 public key: the
++	/// root certificate this one connection must chain to.  Empty (the
++	/// default) leaves cert handling exactly as it was.
++	///
++	/// When set, the peer MUST present a cert carrying a CA signature that
++	/// verifies against this key, and an unsigned or otherwise-signed cert
++	/// fails the connection -- AllowRemoteUnsignedCert is not consulted, so
++	/// the open-source "allow everything" default cannot quietly apply.
++	/// The process-wide cert store is not consulted either: the pin is the
++	/// key itself, so two servers pinned by the same client cannot issue
++	/// certs for each other's identity.
++	///
++	/// Intended for the case where a client learns one server's public key
++	/// out of band (a join URL, a directory) and wants the GNS session
++	/// authenticated against it, so that relaying the rendezvous through an
++	/// untrusted party does not let that party substitute its own keys.
++	k_ESteamNetworkingConfig_PinnedRootCertPublicKey = 1200,
++
+ 	/// [connection int32] Minimum/maximum send rate clamp, in bytes/sec.
+ 	/// At the time of this writing these two options should always be set to
+ 	/// the same value, to manually configure a specific send rate.  The default
+--- a/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
++++ b/src/steamnetworkingsockets/clientlib/csteamnetworkingsockets.cpp
+@@ -122,6 +122,7 @@
+ #endif
+ 
+ #ifdef STEAMNETWORKINGSOCKETS_ENABLE_ICE
++DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, PinnedRootCertPublicKey, "" );
+ DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_STUN_ServerList, "" );
+ DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_TURN_ServerList, "" );
+ DEFINE_CONNECTON_DEFAULT_CONFIGVAL( std::string, P2P_TURN_UserList, "" );
+@@ -733,6 +734,17 @@
+ 	if ( !pAuthScope )
+ 	{
+ 		SpewWarning( "SetCertificate: We are not currently able to verify our own cert!  %s.  Continuing anyway!", errMsg );
++
++		// CertStore_CheckCert is what deserializes msgCert, so on that path it
++		// is still empty and every field read below reports nonsense -- a cert
++		// signed by a root the store does not know about failed here as
++		// "invalid public key" rather than as the unverifiable cert it is.
++		// Continuing anyway means continuing with the cert.
++		if ( !msgCert.ParseFromString( msgCertSigned.cert() ) )
++		{
++			V_strcpy_safe( errMsg, "Cert failed protobuf decode" );
++			return false;
++		}
+ 	}
+ 
+ 	// Extract the identity from the cert
+@@ -2584,6 +2596,116 @@
+ 
+ /////////////////////////////////////////////////////////////////////////////
+ //
++// Self-signed certificates
++//
++// Two halves of issuing a cert for this interface's own connection key,
++// signed by a key the application owns.  Split so that the private key never
++// crosses this boundary: the caller signs the blob with whatever crypto stack
++// already holds its key, and GNS only does the protobuf assembly that its
++// message definitions are not public enough for the caller to do itself.
++//
++/////////////////////////////////////////////////////////////////////////////
++
++STEAMNETWORKINGSOCKETS_INTERFACE bool SteamNetworkingSockets_GetSelfSignedCertBlobToSign(
++	ISteamNetworkingSockets *pInterface, int nSecondsValid,
++	int *pcbBlob, void *pBlob, SteamNetworkingErrMsg &errMsg )
++{
++	if ( !pInterface || !pcbBlob )
++	{
++		V_strcpy_safe( errMsg, "Bad parameters" );
++		return false;
++	}
++
++	// The interface already builds a cert carrying its own connection public
++	// key and identity for the request path; reuse it rather than duplicating
++	// how that key is generated and cached.
++	int cbRequest = 0;
++	if ( !pInterface->GetCertificateRequest( &cbRequest, nullptr, errMsg ) )
++		return false;
++	std_vector<uint8> bufRequest;
++	bufRequest.resize( cbRequest );
++	if ( !pInterface->GetCertificateRequest( &cbRequest, bufRequest.data(), errMsg ) )
++		return false;
++
++	CMsgSteamDatagramCertificateRequest msgRequest;
++	if ( !msgRequest.ParseFromArray( bufRequest.data(), cbRequest ) )
++	{
++		V_strcpy_safe( errMsg, "CMsgSteamDatagramCertificateRequest failed protobuf parse" );
++		return false;
++	}
++
++	CMsgSteamDatagramCertificate msgCert = msgRequest.cert();
++	if ( msgCert.key_data().empty() )
++	{
++		V_strcpy_safe( errMsg, "Certificate request carried no public key" );
++		return false;
++	}
++
++	// Same cast this file already uses to reach the concrete utils object:
++	// neither GetAppID nor GetTimeSecure is on the public interface.
++	CSteamNetworkingUtils *pUtils = (CSteamNetworkingUtils *)SteamNetworkingUtils();
++
++	// A cert bound to an identity must name an app, or the peer rejects it
++	// before it ever looks at who signed it.  It has to be *our* app ID --
++	// SetCertificate checks the cert it is handed against this interface's own
++	// ID, so any other value comes back as "does not authorize us".
++	msgCert.add_app_ids( pUtils->GetAppID() );
++
++	// The clock the verifying side checks expiry against.
++	time_t timeNow = pUtils->GetTimeSecure();
++	msgCert.set_time_created( (uint32)timeNow );
++	msgCert.set_time_expiry( (uint32)( timeNow + nSecondsValid ) );
++
++	int cb = ProtoMsgByteSize( msgCert );
++	if ( !pBlob )
++	{
++		*pcbBlob = cb;
++		return true;
++	}
++	if ( cb > *pcbBlob )
++	{
++		*pcbBlob = cb;
++		V_sprintf_safe( errMsg, "%d byte buffer not big enough; %d bytes required", *pcbBlob, cb );
++		return false;
++	}
++	*pcbBlob = cb;
++	uint8 *p = (uint8 *)pBlob;
++	DbgVerify( msgCert.SerializeWithCachedSizesToArray( p ) == p + cb );
++	return true;
++}
++
++STEAMNETWORKINGSOCKETS_INTERFACE bool SteamNetworkingSockets_InstallSelfSignedCert(
++	ISteamNetworkingSockets *pInterface,
++	const void *pCertBlob, int cbCertBlob,
++	const void *pSignature, int cbSignature,
++	const void *pRootPublicKey, int cbRootPublicKey,
++	SteamNetworkingErrMsg &errMsg )
++{
++	if ( !pInterface || !pCertBlob || !pSignature || !pRootPublicKey )
++	{
++		V_strcpy_safe( errMsg, "Bad parameters" );
++		return false;
++	}
++	if ( cbSignature != sizeof(CryptoSignature_t) )
++	{
++		V_sprintf_safe( errMsg, "Signature must be %d bytes, got %d", (int)sizeof(CryptoSignature_t), cbSignature );
++		return false;
++	}
++
++	CMsgSteamDatagramCertificateSigned msgSigned;
++	msgSigned.set_cert( pCertBlob, cbCertBlob );
++	msgSigned.set_ca_signature( pSignature, cbSignature );
++	msgSigned.set_ca_key_id( CalculatePublicKeyID_Ed25519( pRootPublicKey, cbRootPublicKey ) );
++
++	std_vector<uint8> buf;
++	buf.resize( ProtoMsgByteSize( msgSigned ) );
++	DbgVerify( msgSigned.SerializeWithCachedSizesToArray( buf.data() ) == buf.data() + buf.size() );
++
++	return pInterface->SetCertificate( buf.data(), (int)buf.size(), errMsg );
++}
++
++/////////////////////////////////////////////////////////////////////////////
++//
+ // Global API interface
+ //
+ /////////////////////////////////////////////////////////////////////////////
+--- a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp
++++ b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.cpp
+@@ -1048,6 +1048,7 @@
+ 	m_msgCryptRemote.Clear();
+ 	m_bCertHasIdentity = false;
+ 	m_bRemoteCertHasTrustedCASignature = false;
++	m_bRemoteCertPinnedRootVerified = false;
+ 	m_keyPrivate.Wipe();
+ 	ClearLocalCrypto();
+ }
+@@ -1401,7 +1402,35 @@
+ 
+ 	// If they presented a signature, it must be valid
+ 	const CertAuthScope *pCACertAuthScope = nullptr;
+-	if ( msgCert.has_ca_signature() )
++	const std::string &sPinnedRoot = m_connectionConfig.PinnedRootCertPublicKey.Get();
++	if ( !sPinnedRoot.empty() )
++	{
++
++		// This connection was told exactly which key must have issued the peer's
++		// cert, so that is the only question worth asking.  Deliberately none of
++		// the usual fallbacks apply: not the cert store (another trusted root
++		// must not be able to vouch for this peer) and not AllowRemoteUnsignedCert
++		// (which is an unconditional "allow" in open-source builds, and would
++		// hand the connection to anyone willing to drop the signature).
++		std::string sRawRootKey;
++		if ( !BParsePinnedRootCertPublicKey( sPinnedRoot, sRawRootKey, tmpErrMsg ) )
++		{
++			V_sprintf_safe( errMsg, "Pinned root cert: %s", tmpErrMsg );
++			return k_ESteamNetConnectionEnd_Misc_InternalError;
++		}
++		if ( !BCheckCertAgainstPinnedRoot( msgCert, sRawRootKey, tmpErrMsg ) )
++		{
++			V_sprintf_safe( errMsg, "Cert does not chain to the pinned root: %s", tmpErrMsg );
++			return k_ESteamNetConnectionEnd_Remote_BadCert;
++		}
++		if ( !m_msgCertRemote.ParseFromString( m_sCertRemote ) )
++		{
++			V_strcpy_safe( errMsg, "Cert failed protobuf decode" );
++			return k_ESteamNetConnectionEnd_Remote_BadCrypt;
++		}
++		m_bRemoteCertPinnedRootVerified = true;
++	}
++	else if ( msgCert.has_ca_signature() )
+ 	{
+ 
+ 		// Check the signature and chain of trust, and expiry, and deserialize the signed cert
+@@ -1425,7 +1454,7 @@
+ 	}
+ 
+ 	// If we didn't deserialize the cert above, do so now
+-	if ( !pCACertAuthScope )
++	if ( !pCACertAuthScope && !m_bRemoteCertPinnedRootVerified )
+ 	{
+ 
+ 		// Deserialize the cert
+@@ -1501,7 +1530,10 @@
+ 	}
+ 
+ 	// Remember if we they were authenticated
+-	m_bRemoteCertHasTrustedCASignature = ( pCACertAuthScope != nullptr );
++	// A cert that verified against this connection's pinned root is authenticated
++	// in exactly the sense this flag reports, so the Unauthenticated connection
++	// flag clears and callers see the session as trusted.
++	m_bRemoteCertHasTrustedCASignature = ( pCACertAuthScope != nullptr ) || m_bRemoteCertPinnedRootVerified;
+ 
+ 	// Deserialize crypt info
+ 	if ( !m_msgCryptRemote.ParseFromString( m_sCryptRemote ) )
+@@ -1555,6 +1587,21 @@
+ 	if ( !m_msgSignedCertLocal.has_cert() )
+ 	{
+ 
++		// An accept-side connection never went through BThinkCryptoReady, which is
++		// where the initiating side picks the interface's cert up, so without this
++		// a server holding a perfectly good cert still answers unsigned -- and a
++		// client that pins a root has nothing to check.
++		if ( m_pSteamNetworkingSocketsInterface->GetSecondsUntilCertExpiry() > 0 )
++		{
++			SetLocalCert(
++				m_pSteamNetworkingSocketsInterface->m_msgSignedCert,
++				m_pSteamNetworkingSocketsInterface->m_keyPrivateKey,
++				m_pSteamNetworkingSocketsInterface->BCertHasIdentity() );
++		}
++	}
++	if ( !m_msgSignedCertLocal.has_cert() )
++	{
++
+ 		// Double-check that this is allowed
+ 		EUnsignedCert eLocalUnsignedCert = AllowLocalUnsignedCert();
+ 		if ( eLocalUnsignedCert == k_EUnsignedCert_Disallow )
+@@ -1817,6 +1864,13 @@
+ {
+ 	AssertLocksHeldByCurrentThread( "BFinishCryptoHandshake" );
+ 
++	// A pinned root already decided this, against a key chosen for this one
++	// connection rather than a store shared with every other peer.  The app-ID
++	// scoping below expresses which CA-granted authority a cert carries, which
++	// has no counterpart when the authority is a single pinned key.
++	if ( m_bRemoteCertPinnedRootVerified )
++		return k_ESteamNetConnectionEnd_Invalid;
++
+ 	// Allowed for this app?
+ 	if ( !CheckCertAppID( m_msgCertRemote, pCACertAuthScope, m_pSteamNetworkingSocketsInterface->m_pSteamNetworkingUtils->GetAppID(), errMsg ) )
+ 		return k_ESteamNetConnectionEnd_Remote_BadCert;
+--- a/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.h
++++ b/src/steamnetworkingsockets/clientlib/steamnetworkingsockets_connections.h
+@@ -805,6 +805,9 @@
+ 	CMsgSteamDatagramCertificate m_msgCertRemote;
+ 	CMsgSteamDatagramSessionCryptInfo m_msgCryptRemote;
+ 	bool m_bRemoteCertHasTrustedCASignature; // Could expand this to an enum of different states
++	// Peer's cert verified against k_ESteamNetworkingConfig_PinnedRootCertPublicKey,
++	// rather than against the shared cert store.
++	bool m_bRemoteCertPinnedRootVerified;
+ 
+ 	// Local crypto info for this connection
+ 	CECSigningPrivateKey m_keyPrivate; // Private key corresponding to our cert.  We'll wipe this in FinalizeLocalCrypto, as soon as we've locked in the crypto properties we're going to use
+--- a/src/steamnetworkingsockets/steamnetworkingsockets_certs.cpp
++++ b/src/steamnetworkingsockets/steamnetworkingsockets_certs.cpp
+@@ -304,6 +304,56 @@
+ 	return true;
+ }
+ 
++bool BParsePinnedRootCertPublicKey( const std::string &sBase64, std::string &outRawKey, SteamNetworkingErrMsg &errMsg )
++{
++	outRawKey.clear();
++	if ( sBase64.empty() )
++	{
++		V_strcpy_safe( errMsg, "Pinned root cert public key is empty" );
++		return false;
++	}
++
++	std_vector<uint8> buf;
++	uint32 cbDecoded = CCrypto::Base64DecodeMaxOutput( sBase64.length() );
++	buf.resize( cbDecoded );
++	if ( !CCrypto::Base64Decode( sBase64.c_str(), sBase64.length(), buf.data(), &cbDecoded, false ) )
++	{
++		V_strcpy_safe( errMsg, "Pinned root cert public key is not valid base64" );
++		return false;
++	}
++
++	// Let the key object decide what lengths are acceptable, rather than
++	// duplicating a size constant that lives with the crypto backend.
++	CECSigningPublicKey keyPublic;
++	if ( !keyPublic.SetRawDataWithoutWipingInput( buf.data(), cbDecoded ) )
++	{
++		V_sprintf_safe( errMsg, "Pinned root cert public key is not a valid Ed25519 public key (%u bytes)", cbDecoded );
++		return false;
++	}
++
++	outRawKey.assign( (const char *)buf.data(), cbDecoded );
++	return true;
++}
++
++bool BCheckCertAgainstPinnedRoot( const CMsgSteamDatagramCertificateSigned &msgCertSigned, const std::string &sRawRootPublicKey, SteamNetworkingErrMsg &errMsg )
++{
++	// A pinned root is an instruction to require a signature, so an
++	// unsigned cert is a failure here rather than something to fall back on.
++	if ( !msgCertSigned.has_ca_signature() || msgCertSigned.ca_signature().empty() )
++	{
++		V_strcpy_safe( errMsg, "Peer presented a cert with no CA signature, but a root cert is pinned for this connection" );
++		return false;
++	}
++
++	// The pinned key is the whole authority: we deliberately do not consult
++	// the process-wide cert store, so no other trusted key can vouch for
++	// this peer, and ca_key_id is a hint we never have to believe.
++	if ( !BCheckSignature( msgCertSigned.cert(), CMsgSteamDatagramCertificate_EKeyType_ED25519, sRawRootPublicKey, msgCertSigned.ca_signature(), errMsg ) )
++		return false;
++
++	return true;
++}
++
+ bool ParseCertFromBase64( const char *pBase64Data, size_t cbBase64Data, CMsgSteamDatagramCertificateSigned &outMsgSignedCert, SteamNetworkingErrMsg &errMsg )
+ {
+ 
+--- a/src/steamnetworkingsockets/steamnetworkingsockets_internal.h
++++ b/src/steamnetworkingsockets/steamnetworkingsockets_internal.h
+@@ -586,6 +586,16 @@
+ extern bool ParseCertFromPEM( const void *pCert, size_t cbCert, CMsgSteamDatagramCertificateSigned &outMsgSignedCert, SteamNetworkingErrMsg &errMsg );
+ extern bool ParseCertFromBase64( const char *pBase64Data, size_t cbBase64Data, CMsgSteamDatagramCertificateSigned &outMsgSignedCert, SteamNetworkingErrMsg &errMsg );
+ 
++/// Decode the base64 body of k_ESteamNetworkingConfig_PinnedRootCertPublicKey into
++/// the raw 32 bytes BCheckSignature wants.  False if it isn't valid base64 of an
++/// Ed25519 public key.
++extern bool BParsePinnedRootCertPublicKey( const std::string &sBase64, std::string &outRawKey, SteamNetworkingErrMsg &errMsg );
++
++/// Verify a peer's signed cert against one pinned Ed25519 root public key, with no
++/// reference to the process-wide cert store.  The signature must cover the cert
++/// bytes exactly as CertStore_CheckCASignature would have checked them.
++extern bool BCheckCertAgainstPinnedRoot( const CMsgSteamDatagramCertificateSigned &msgCertSigned, const std::string &sRawRootPublicKey, SteamNetworkingErrMsg &errMsg );
++
+ 
+ inline bool IsPrivateIP( uint32 unIP )
+ {
+@@ -884,6 +894,7 @@
+ 	ConfigValue<int32> LocalVirtualPort;
+ 	ConfigValue<int64> ConnectionUserData;
+ 	ConfigValue<int32> SendTimeSincePreviousPacket;
++	ConfigValue<std::string> PinnedRootCertPublicKey;
+ 
+ 	#ifdef STEAMNETWORKINGSOCKETS_ENABLE_DIAGNOSTICSUI
+ 	ConfigValue<int32> EnableDiagnosticsUI;
