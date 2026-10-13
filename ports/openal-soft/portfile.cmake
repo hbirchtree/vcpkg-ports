@@ -27,6 +27,7 @@ if(VCPKG_TARGET_IS_EMSCRIPTEN)
     string(APPEND VCPKG_CXX_FLAGS " -fwasm-exceptions -msimd128")
     set(EMSCRIPTEN_OPTIONS
         "-DCMAKE_SHARED_LINKER_FLAGS=-sSIDE_MODULE=1 -pthread -fwasm-exceptions"
+        "-DCMAKE_PROJECT_INCLUDE=${CMAKE_CURRENT_LIST_DIR}/wasm-side-module.cmake"
     )
 endif()
 
