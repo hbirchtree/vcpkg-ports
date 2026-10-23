@@ -1,0 +1,33 @@
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -165,7 +165,7 @@
+ 		# patch. Kept as an elseif branch (not folded away) only to keep
+ 		# giving Emscripten its own explicit arm in this chain, matching
+ 		# the rest of the file's style.
+-	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
++	elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+ 		target_compile_definitions(${TGT} PUBLIC OSX)
+ 	elseif(CMAKE_SYSTEM_NAME MATCHES FreeBSD)
+ 		target_compile_definitions(${TGT} PUBLIC FREEBSD)
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -359,7 +359,7 @@
+ 		#endif()
+ 	elseif(CMAKE_SYSTEM_NAME MATCHES Emscripten)
+ 		# No dl linking needed or available.
+-	elseif(CMAKE_SYSTEM_NAME MATCHES Darwin)
++	elseif(CMAKE_SYSTEM_NAME MATCHES "Darwin|iOS")
+ 		#if(USE_STEAMWEBRTC AND NOT STEAMWEBRTC_USE_STATIC_LIBS)
+ 		#	target_link_libraries(${GNS_TARGET} PRIVATE dl)
+ 		#endif()
+--- a/src/tier0/dbg.cpp
++++ b/src/tier0/dbg.cpp
+@@ -125,6 +125,8 @@
+     return false;
+ #elif IsEmscripten()
+ 	return false;
++#elif IsIOS() || IsTVOS()
++	return false;
+ #else
+ 	#error "HALP"
+ #endif

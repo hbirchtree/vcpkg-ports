@@ -15,6 +15,7 @@ vcpkg_from_github(
         add-listen-socket-raw-send.patch
         add-udp-datachannel-connect.patch
         add-pinned-root-cert-auth.patch
+        fix-ios-support.patch
 )
 
 set(CRYPTO_BACKEND OpenSSL)
